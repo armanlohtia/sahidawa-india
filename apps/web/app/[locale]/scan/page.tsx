@@ -1,8 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react"; 
-
-
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
     Camera,
     ShieldCheck,
@@ -347,10 +345,102 @@ export default function ScanPage() {
     const [batchInput, setBatchInput] = useState("");
     const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null);
     const [verifyError, setVerifyError] = useState<string | null>(null);
-
     const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
     const [showCamera, setShowCamera] = useState(false);
     const videoRef = useRef<HTMLVideoElement>(null);
+
+    useEffect(() => {
+        if (showCamera && cameraStream && videoRef.current) {
+            videoRef.current.srcObject = cameraStream;
+        }
+    }, [showCamera, cameraStream]);
+
+    const handleOpenCamera = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: "environment" },
+            });
+            setCameraStream(stream);
+            setShowCamera(true);
+        } catch {
+            toast.error("Camera access denied. Please allow camera permissions and try again.");
+        }
+    };
+
+    const handleCloseCamera = () => {
+        cameraStream?.getTracks().forEach((track) => track.stop());
+        setCameraStream(null);
+        setShowCamera(false);
+    };
+
+    const handleCapture = async () => {
+        if (!videoRef.current) return;
+
+        const canvas = document.createElement("canvas");
+        canvas.width = videoRef.current.videoWidth;
+        canvas.height = videoRef.current.videoHeight;
+        canvas.getContext("2d")?.drawImage(videoRef.current, 0, 0);
+        const dataUrl = canvas.toDataURL("image/jpeg");
+        setUploadedImage(dataUrl);
+        handleCloseCamera();
+
+        // Convert canvas to Blob and send to OCR service to auto-extract batch number
+        canvas.toBlob(async (blob) => {
+            if (!blob) {
+                toast.error("Failed to capture image. Please try again.");
+                return;
+            }
+
+            setIsScanning(true);
+            setShowResult(false);
+            setVerifyResult(null);
+            setVerifyError(null);
+
+            try {
+                const ML_BASE = process.env.NEXT_PUBLIC_ML_URL ?? "http://localhost:8000";
+                const formData = new FormData();
+                formData.append("file", blob, "capture.jpg");
+
+                const ocrRes = await fetch(`${ML_BASE}/ocr/extract`, {
+                    method: "POST",
+                    body: formData,
+                });
+
+                if (!ocrRes.ok) {
+                    throw new Error(`OCR service error (${ocrRes.status})`);
+                }
+
+                const ocrData = await ocrRes.json() as { text: string; confidence: number };
+                const extractedText = ocrData.text ?? "";
+
+                // Try to extract a batch number pattern from OCR text (e.g. "Batch No: ABC123")
+                const batchMatch = extractedText.match(
+                    /(?:batch\s*(?:no|number|#)?[:.\s]*)\s*([A-Z0-9/-]{4,20})/i
+                );
+                const extractedBatch = batchMatch?.[1]?.trim() ?? "";
+
+                if (extractedBatch) {
+                    setBatchInput(extractedBatch);
+                    toast.success(`Batch number detected: ${extractedBatch}`);
+                    await handleVerify(extractedBatch);
+                } else if (batchInput.trim()) {
+                    // Fall back to manually entered batch number if OCR couldn't find one
+                    toast.info("Could not auto-detect batch number. Using manually entered value.");
+                    await handleVerify(batchInput);
+                } else {
+                    setIsScanning(false);
+                    toast.error(
+                        "Could not detect a batch number from the image. Please enter it manually."
+                    );
+                }
+            } catch (err) {
+                setIsScanning(false);
+                toast.error(
+                    err instanceof Error ? err.message : "OCR failed. Please enter batch number manually."
+                );
+            }
+        }, "image/jpeg", 0.92);
+    };
 
     const handleVerify = useCallback(async (batch: string) => {
         if (!batch.trim()) {
@@ -431,40 +521,6 @@ export default function ScanPage() {
         setVerifyResult(null);
         setVerifyError(null);
     };
-
-    const handleOpenCamera = async () => {
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: "environment" }, // use back camera on mobile
-        });
-        setCameraStream(stream);
-        setShowCamera(true);
-    } catch (err) {
-        toast.error("Camera access denied. Please allow camera permissions.");
-    }
-};
-
-const handleCloseCamera = () => {
-    cameraStream?.getTracks().forEach((track) => track.stop());
-    setCameraStream(null);
-    setShowCamera(false);
-};
-
-const handleCapture = () => {
-    if (!videoRef.current) return;
-    const canvas = document.createElement("canvas");
-    canvas.width = videoRef.current.videoWidth;
-    canvas.height = videoRef.current.videoHeight;
-    canvas.getContext("2d")?.drawImage(videoRef.current, 0, 0);
-    const dataUrl = canvas.toDataURL("image/jpeg");
-    setUploadedImage(dataUrl);
-    handleCloseCamera();
-    if (!batchInput.trim()) {
-        toast.error("Please also enter a batch number to verify");
-        return;
-    }
-    handleVerify(batchInput);
-};
 
     const handleShare = async () => {
         let shareText = "";
@@ -595,31 +651,7 @@ const handleCapture = () => {
                         {!verifyError && verifyResult && !verifyResult.verified && (
                             <UnverifiedResult onScanAgain={handleDismissResult} />
                         )}
-                {showCamera && (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black">
-        <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            className="h-full w-full object-cover"
-            onCanPlay={() => { videoRef.current?.play(); }}
-        />
-        <div className="absolute bottom-8 flex gap-4">
-            <button
-                onClick={handleCapture}
-                className="rounded-full bg-white px-6 py-3 font-bold text-black"
-            >
-                Capture
-            </button>
-            <button
-                onClick={handleCloseCamera}
-                className="rounded-full bg-white/20 px-6 py-3 font-bold text-white"
-            >
-                Cancel
-            </button>
-        </div>
-    </div>
-)}    </div>
+                    </div>
                 )}
             </div>
 
@@ -654,12 +686,51 @@ const handleCapture = () => {
                         <Layers size={18} />
                         Upload Photo
                     </label>
-                    <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-white/5">
-                        <AlertCircle size={20} className="text-white/50" />
-                    </div>
+                    <button
+                        onClick={handleOpenCamera}
+                        className="flex items-center gap-2 rounded-full bg-emerald-500 px-6 py-3 text-sm font-bold text-white shadow-lg transition-colors hover:bg-emerald-400"
+                    >
+                        <Camera size={18} />
+                        Scan Live
+                    </button>
                 </div>
             </div>
             <Footer />
+
+            {showCamera && (
+                <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black">
+                    <video
+                        ref={videoRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="h-full w-full object-cover"
+                    />
+                    <div className="absolute top-4 left-4">
+                        <button
+                            onClick={handleCloseCamera}
+                            className="rounded-full bg-black/50 p-3 text-white backdrop-blur-sm transition-colors hover:bg-black/70"
+                        >
+                            <X size={24} />
+                        </button>
+                    </div>
+                    <div className="absolute bottom-12 flex gap-4">
+                        <button
+                            onClick={handleCapture}
+                            className="flex items-center gap-2 rounded-full bg-emerald-500 px-8 py-4 text-base font-bold text-white shadow-xl transition-colors hover:bg-emerald-400"
+                        >
+                            <Camera size={20} />
+                            Capture
+                        </button>
+                        <button
+                            onClick={handleCloseCamera}
+                            className="rounded-full bg-white/20 px-8 py-4 text-base font-bold text-white backdrop-blur-sm transition-colors hover:bg-white/30"
+                        >
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
